@@ -2,14 +2,18 @@
 Built-in block-level token classes.
 """
 
+import re
+import sys
 from types import GeneratorType
 from itertools import zip_longest
 import mistletoe.block_tokenizer as tokenizer
 import mistletoe.span_token as span_token
 
-
-__all__ = ['Heading', 'Quote', 'BlockCode', 'Separator', 'List', 'Table',
-           'FootnoteBlock', 'Paragraph']
+"""
+Tokens to be included in the parsing process, in the order specified.
+"""
+__all__ = ['Heading', 'Quote', 'CodeFence', 'BlockCode', 'Separator',
+           'List', 'Table', 'FootnoteBlock', 'SetextHeading', 'Paragraph']
 
 
 def tokenize(lines, root=None):
@@ -31,7 +35,7 @@ def tokenize(lines, root=None):
 def add_token(token_cls, position=0):
     """
     Allows external manipulation of the parsing process.
-    This function is called in BaseRenderer.__enter__.
+    This function is usually called in BaseRenderer.__enter__.
 
     Arguments:
         token_cls (SpanToken): token to be included in the parsing process.
@@ -42,12 +46,20 @@ def add_token(token_cls, position=0):
 def remove_token(token_cls):
     """
     Allows external manipulation of the parsing process.
-    This function is called in BaseRenderer.__exit__.
+    This function is usually called in BaseRenderer.__exit__.
 
     Arguments:
         token_cls (SpanToken): token to be removed from the parsing process.
     """
     _token_types.remove(token_cls)
+
+
+def reset_tokens():
+    """
+    Returns a list of tokens with the original tokens.
+    """
+    global _token_types
+    _token_types = [globals()[cls_name] for cls_name in __all__]
 
 
 class BlockToken(object):
@@ -98,6 +110,8 @@ class Document(BlockToken):
     Document token.
     """
     def __init__(self, lines):
+        if isinstance(lines, str):
+            lines = lines.splitlines(keepends=True)
         self.footnotes = {}
         # Document tokens have immediate access to first-level block tokens.
         # Useful for footnotes, etc.
@@ -156,12 +170,7 @@ class Quote(BlockToken):
     Quote token. (["> # heading\n", "> paragraph\n"])
     """
     def __init__(self, lines):
-        content = []
-        for line in lines:
-            if line.startswith('> '):
-                content.append(line[2:])
-            else:  # lazy continuation
-                content.append(line)
+        content = [line[2:] if line.startswith('> ') else line for line in lines]
         super().__init__(content, tokenize)
 
     @staticmethod
@@ -214,16 +223,16 @@ class CodeFence(BlockToken):
     @classmethod
     def start(cls, line):
         if line.startswith('```'):
-            cls._open_line = '```\n'
+            cls._open_line = '```'
             return True
         if line.startswith('~~~'):
-            cls._open_line = '~~~\n'
+            cls._open_line = '~~~'
             return True
         return False
 
     @classmethod
     def read(cls, lines):
-        return until(cls._open_line, lines)
+        return until(cls._open_line, lines, func=str.startswith)
 
 
 class List(BlockToken):
@@ -236,19 +245,15 @@ class List(BlockToken):
         start (int): first index of ordered list (undefined if unordered).
     """
     def __init__(self, lines):
-        # Every codebase needs a line of code that its author
-        # doesn't understand. This is that line of code.
-        # I need to cast this generator into a list because... why?
-        # Someone please open a pull request and enlighten me...
-        self._children = list(List.build_list(lines))
+        self._children = self.build_list(lines)
         leader = lines[0].split(' ', 1)[0]
         if leader[:-1].isdigit():
             self.start = int(leader[:-1])
         else:
             self.start = None
 
-    @staticmethod
-    def build_list(lines):
+    @classmethod
+    def build_list(cls, lines):
         """
         Constructor helper; builds a list from lines.
 
@@ -281,22 +286,21 @@ class List(BlockToken):
                 return
             yield List(line_buffer) if nested else ListItem(line_buffer)
             nested = False
-            line_buffer.clear()
+            line_buffer = []
 
         for line in lines:
-            if List.has_valid_leader(line):
+            if cls.has_valid_leader(line):
                 yield from clear_buffer()
-            elif line.startswith(' '*4):
+            elif line.startswith('    '):
                 line = line[4:]
-                if List.has_valid_leader(line):
-                    if not nested:
-                        yield from clear_buffer()
+                if cls.has_valid_leader(line) and not nested:
+                    yield from clear_buffer()
                     nested = True
             line_buffer.append(line)
         yield from clear_buffer()
 
-    @staticmethod
-    def has_valid_leader(line):
+    @classmethod
+    def has_valid_leader(cls, line):
         """
         Helper function; mainly because _build_list is gross enough.
 
@@ -305,25 +309,37 @@ class List(BlockToken):
         return (line.startswith(('+ ', '- ', '* '))         # unordered
                 or (line.split(' ', 1)[0][:-1].isdigit()))  # ordered
 
-    @staticmethod
-    def start(line):
-        return List.has_valid_leader(line.strip())
+    @classmethod
+    def start(cls, line):
+        return cls.has_valid_leader(line.strip())
+
+    @classmethod
+    def read(cls, lines):
+        line_buffer = []
+        for line in lines:
+            if line == '\n' and not cls.has_valid_leader(lines.peek() or ''):
+                break
+            line_buffer.append(line)
+        return line_buffer
 
 
 class ListItem(BlockToken):
     """
     List item token. (["- item 1\n", "continued\n"])
-    Boundary between span-level and block-level tokens.
 
     Should only be called by List._build_list().
     """
     def __init__(self, lines):
-        line = ' '.join([line.strip() for line in lines])
-        try:
-            content = line.split(' ', 1)[1].strip()
-        except IndexError:
-            content = ''
-        super().__init__(content, span_token.tokenize_inner)
+        if lines[-1].strip() == '':
+            lines[0] = lines[0].split(' ', 1)[1]
+            super().__init__(lines, tokenize)
+        else:
+            line = ' '.join([line.strip() for line in lines])
+            try:
+                content = line.split(' ', 1)[1].strip()
+            except IndexError:
+                content = ''
+            super().__init__(content, span_token.tokenize_inner)
 
 
 class Table(BlockToken):
@@ -336,7 +352,7 @@ class Table(BlockToken):
         children (tuple): inner tokens (TableRows).
     """
     def __init__(self, lines):
-        if lines[1].find('---') != -1:
+        if '---' in lines[1]:
             self.column_align = [self.parse_align(column)
                     for column in self.split_delimiter(lines[1])]
             self.header = TableRow(lines[0], self.column_align)
@@ -356,7 +372,7 @@ class Table(BlockToken):
         Returns:
             a list of align options (None, 0 or 1).
         """
-        return (column.strip() for column in delimiter[1:-2].split('|'))
+        return re.findall(r':?---+:?', delimiter)
 
     @staticmethod
     def parse_align(column):
@@ -368,25 +384,19 @@ class Table(BlockToken):
             0    if align = center;
             1    if align = right.
         """
-        if column[:4] == ':---' and column[-4:] == '---:':
-            return 0
-        if column[-4:] == '---:':
-            return 1
-        return None
+        return (0 if column[0] == ':' else 1) if column[-1] == ':' else None
 
     @staticmethod
     def start(line):
-        return line.startswith('|') and line.endswith('|\n')
+        return '|' in line
 
     @staticmethod
     def read(lines):
         line_buffer = []
-        for line in lines:
-            if (not (line.startswith('|') and line.endswith('|\n'))
-                    or line == '\n'):
-                break
-            else:
-                line_buffer.append(line)
+        while lines.peek() is not None and '|' in lines.peek():
+            line_buffer.append(next(lines))
+        if len(line_buffer) < 1 or '---' not in line_buffer[0]:
+            raise tokenizer.MismatchException()
         return line_buffer
 
 
@@ -398,7 +408,7 @@ class TableRow(BlockToken):
     """
     def __init__(self, line, row_align=None):
         self.row_align = row_align or [None]
-        cells = line[1:-2].split('|')
+        cells = filter(None, line.strip().split('|'))
         self._children = (TableCell(cell.strip(), align)
                           for cell, align in zip_longest(cells, self.row_align))
 
@@ -447,6 +457,10 @@ class FootnoteBlock(BlockToken):
             line_buffer.append(next(lines))
         return line_buffer
 
+    def store_footnotes(self, root):
+        for entry in self.children:
+            root.footnotes[entry.key] = entry.value
+
 
 class FootnoteEntry(BlockToken):
     """
@@ -482,17 +496,15 @@ class Separator(BlockToken):
         return []
 
 
-def until(stop_line, lines):
+def until(stop_line, lines, func=None):
     line_buffer = []
     for line in lines:
-        if line == stop_line:
+        if (line == stop_line if func is None else func(line, stop_line)):
             break
         line_buffer.append(line)
     return line_buffer
 
 
-"""
-Tokens to be included in the parsing process, in the order specified.
-"""
-_token_types = [Heading, Quote, CodeFence, BlockCode, Separator, List,
-                Table, FootnoteBlock, SetextHeading, Paragraph]
+_token_types = []
+reset_tokens()
+
