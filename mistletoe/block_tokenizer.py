@@ -49,7 +49,7 @@ class FileWrapper:
                     code_fence = line[:3]
                 elif line.startswith(code_fence):
                     code_fence = ''
-            line_buffer.append(line.replace('\t', '    '))
+            line_buffer.append(line.replace('\t', '    ').replace('\r\n', '\n'))
         return line_buffer
 
 
@@ -71,19 +71,18 @@ def tokenize(iterable, token_types, root=None):
         for token_type in token_types:
             try:
                 if token_type.start(line):
-                    token = token_type([line] + token_type.read(lines))
-                    if root and token.__class__.__name__ == 'FootnoteBlock':
-                        store_footnotes(root, token)
+                    content = [line]
+                    content.extend(token_type.read(lines))
+                    token = token_type(content)
+                    if root and hasattr(token, 'store_footnotes'):
+                        token.store_footnotes(root)
                     else:
                         yield token
                     break
             except MismatchException as e:
                 if e.lines is not None:
-                    yield token_types[-1]([line] + e.lines)
+                    content = [line]
+                    content.extend(e.lines)
+                    yield token_types[-1](content)
                     break
-
-
-def store_footnotes(root_node, footnote_block):
-    for entry in footnote_block.children:
-        root_node.footnotes[entry.key] = entry.value
 
